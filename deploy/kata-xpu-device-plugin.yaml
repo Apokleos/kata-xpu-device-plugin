@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kata-xpu-dp-daemonset
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: kata-xpu-dp-ds
+  template:
+    metadata:
+      labels:
+        name: kata-xpu-dp-ds
+    spec:
+      priorityClassName: system-node-critical
+      tolerations:
+      # Allow this pod to be rescheduled while the node is in "critical add-ons only" mode.
+      # This, along with the annotation above marks this pod as a critical add-on.
+      - key: CriticalAddonsOnly
+        operator: Exists
+      containers:
+      - name: kata-xpu-dp-ctr
+        image: docker.io/library/kata-xpu-device-plugin:v1.3.2
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+          - name: device-plugin
+            mountPath: /var/lib/kubelet/device-plugins
+          - name: pod-resources
+            mountPath: /var/lib/kubelet/pod-resources
+          - name: vfio
+            mountPath: /dev/vfio
+          - name: container-device-interface
+            mountPath: /var/run/cdi
+      imagePullSecrets:
+      - name: regcred
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: pod-resources
+          hostPath:
+            path: /var/lib/kubelet/pod-resources
+        - name: vfio
+          hostPath:
+            path: /dev/vfio
+        - name: container-device-interface
+          hostPath:
+            path: /var/run/cdi
