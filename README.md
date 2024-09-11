@@ -8,7 +8,7 @@
 - [Features](#features)
 - [Prerequisites](#prerequisites)
 - [Architecture](#architecture)
-
+- [TODO](#todo)
 
 ## Overview
 
@@ -27,5 +27,13 @@ Kata-xpu-device-plugin Enhanced Device Plugin is heavily inspired by the [`kubev
 
 ## Architecture
 
-![architecture overview](docs/image.png)
+![workflow](docs/workflow.png)
 
+![architecture overview](docs/full-workflow.png)
+
+## TODO
+
+Now, It only support NVIDIA GPUs !
+
+- To support vGPUs.
+- To support other GPUs
