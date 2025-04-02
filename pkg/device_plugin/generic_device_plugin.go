@@ -3,20 +3,21 @@ package device_plugin
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	cdiutils "kata-xpu-device-plugin/cdi"
 
 	"github.com/fsnotify/fsnotify"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	klog "k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
-
-	cdiutils "kata-xpu-device-plugin/cdi"
 
 	"github.com/google/uuid"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
@@ -44,25 +45,35 @@ type GenericDevicePlugin struct {
 	unhealthy            chan string
 	devicePath           string
 	devpluginName        string
-	devsHealth           []*pluginapi.Device
 	cdiAnnotationPrefix  string
 	deviceListStrategies DeviceListStrategies
+	ResourceName         string
+	sync.RWMutex
 }
 
 // DeviceListStrategies defines which strategies are enabled and should
 // be used when passing the device list to the container runtime.
 type DeviceListStrategies map[string]bool
 
+const (
+	DefaultDeviceListStrategy = "cdi-annotations"
+)
+
 // NewDeviceListStrategies constructs a new DeviceListStrategy
-// func NewDeviceListStrategies(strategies []string) (DeviceListStrategies, error) {
-func newDeviceListStrategies() DeviceListStrategies {
-	ret := map[string]bool{
+func newDeviceListStrategies(strategy string) DeviceListStrategies {
+	if strategy != cdiutils.DeviceListStrategyCDICRI {
+		return DeviceListStrategies(map[string]bool{
+			cdiutils.DeviceListStrategyCDIAnnotations: true,
+			cdiutils.DeviceListStrategyCDICRI:         false,
+		})
+	}
+
+	strategies := map[string]bool{
 		cdiutils.DeviceListStrategyCDIAnnotations: false,
 		cdiutils.DeviceListStrategyCDICRI:         true,
 	}
 
-	// return DeviceListStrategies(ret), nil
-	return DeviceListStrategies(ret)
+	return DeviceListStrategies(strategies)
 }
 
 // Includes returns whether the given strategy is present in the set of strategies.
@@ -71,8 +82,8 @@ func (s DeviceListStrategies) Includes(strategy string) bool {
 }
 
 // Returns an initialized instance of GenericDevicePlugin
-func NewGenericDevicePlugin(devpluginName string, devicePath string, devices []*pluginapi.Device) *GenericDevicePlugin {
-	log.Println("DevicePlugin Name " + devpluginName)
+func NewGenericDevicePlugin(devpluginName string, devicePath string, devices []*pluginapi.Device, strategy string) *GenericDevicePlugin {
+	klog.Infof("DevicePlugin Name " + devpluginName)
 	serverSock := fmt.Sprintf(pluginapi.DevicePluginPath+"kata-xpu-%s.sock", devpluginName)
 	dpi := &GenericDevicePlugin{
 		devs:                 devices,
@@ -82,17 +93,12 @@ func NewGenericDevicePlugin(devpluginName string, devicePath string, devices []*
 		unhealthy:            make(chan string),
 		devpluginName:        devpluginName,
 		devicePath:           devicePath,
-		deviceListStrategies: newDeviceListStrategies(),
+		cdiAnnotationPrefix:  cdiutils.DefaultCDIAnnotationPrefix,
+		deviceListStrategies: newDeviceListStrategies(strategy),
+		ResourceName:         fmt.Sprintf("%s/%s", DevicePluginNamespace, devpluginName),
 	}
-	return dpi
-}
 
-func buildEnv(envList map[string][]string) map[string]string {
-	env := map[string]string{}
-	for key, devList := range envList {
-		env[key] = strings.Join(devList, ",")
-	}
-	return env
+	return dpi
 }
 
 func waitForGrpcServer(socketPath string, timeout time.Duration) error {
@@ -139,7 +145,7 @@ func (dpi *GenericDevicePlugin) Start(stop chan struct{}) error {
 
 	sock, err := net.Listen("unix", dpi.socketPath)
 	if err != nil {
-		log.Printf("[%s] Error creating GRPC server socket: %v", dpi.devpluginName, err)
+		klog.Infof("[%s] Error creating GRPC server socket: %v", dpi.devpluginName, err)
 		return err
 	}
 
@@ -151,18 +157,18 @@ func (dpi *GenericDevicePlugin) Start(stop chan struct{}) error {
 	err = waitForGrpcServer(dpi.socketPath, connectionTimeout)
 	if err != nil {
 		// this err is returned at the end of the Start function
-		log.Printf("[%s] Error connecting to GRPC server: %v", dpi.devpluginName, err)
+		klog.Infof("[%s] Error connecting to GRPC server: %v", dpi.devpluginName, err)
 	}
 
 	err = dpi.Register()
 	if err != nil {
-		log.Printf("[%s] Error registering with device plugin manager: %v", dpi.devpluginName, err)
+		klog.Infof("[%s] Error registering with device plugin manager: %v", dpi.devpluginName, err)
 		return err
 	}
 
 	go dpi.healthCheck()
 
-	log.Println(dpi.devpluginName + " Device plugin server ready")
+	klog.Infof(dpi.devpluginName + " Device plugin server ready")
 
 	return err
 }
@@ -184,7 +190,7 @@ func (dpi *GenericDevicePlugin) Stop() error {
 
 // Restarts DP server
 func (dpi *GenericDevicePlugin) restart() error {
-	log.Printf("Restarting %s device plugin server", dpi.devpluginName)
+	klog.Infof("Restarting %s device plugin server", dpi.devpluginName)
 	if dpi.server == nil {
 		return fmt.Errorf("grpc server instance not found for %s", dpi.devpluginName)
 	}
@@ -226,7 +232,7 @@ func (dpi *GenericDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Dev
 	for {
 		select {
 		case unhealthy := <-dpi.unhealthy:
-			log.Printf("In watch unhealthy")
+			klog.Infof("In watch unhealthy")
 			for _, dev := range dpi.devs {
 				if unhealthy == dev.ID {
 					dev.Health = pluginapi.Unhealthy
@@ -234,7 +240,7 @@ func (dpi *GenericDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Dev
 			}
 			s.Send(&pluginapi.ListAndWatchResponse{Devices: dpi.devs})
 		case healthy := <-dpi.healthy:
-			log.Printf("In watch healthy")
+			klog.Infof("In watch healthy")
 			for _, dev := range dpi.devs {
 				if healthy == dev.ID {
 					dev.Health = pluginapi.Healthy
@@ -250,13 +256,10 @@ func (dpi *GenericDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Dev
 }
 
 func (plugin *GenericDevicePlugin) getCDIDeviceAnnotations(id string, devices ...string) (map[string]string, error) {
-	annotations, err := cdiapi.UpdateAnnotations(map[string]string{}, "kata-xpu-device-plugin", id, devices)
+	// vfio_687298: nvidia.com/gpu=0,nvidia.com/gpu=1
+	annotations, err := cdiapi.UpdateAnnotations(map[string]string{}, "vfio", id[:6], devices)
 	if err != nil {
 		return nil, fmt.Errorf("failed to add CDI annotations: %v", err)
-	}
-
-	if plugin.cdiAnnotationPrefix == cdiutils.DefaultCDIAnnotationPrefix {
-		return annotations, nil
 	}
 
 	// update annotations if a custom CDI prefix is configured
@@ -278,7 +281,7 @@ func (plugin *GenericDevicePlugin) updateResponseForCDI(response *pluginapi.Cont
 	}
 
 	if len(devices) == 0 {
-		log.Println("devices empty.")
+		klog.Infof("devices empty.")
 		return nil
 	}
 
@@ -319,6 +322,7 @@ func (plugin *GenericDevicePlugin) getAllocateResponse(deviceIDs []uint) (*plugi
 // Performs pre allocation checks and allocates a devices based on the request
 func (dpi *GenericDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	responses := pluginapi.AllocateResponse{}
+
 	for _, req := range reqs.ContainerRequests {
 		devIndexes := []uint{}
 		for _, iommuId := range req.DevicesIDs {
@@ -328,12 +332,12 @@ func (dpi *GenericDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Al
 			for _, dev := range nvDevs {
 				iommuGroup, err := readLink(basePath, dev.addr, "iommu_group")
 				if err != nil || iommuGroup != iommuId {
-					log.Println("IommuGroup has changed on the system ", dev.addr)
+					klog.Infof("IommuGroup has changed on the system %v", dev.addr)
 					return nil, fmt.Errorf("invalid allocation request: unknown device: %s", dev.addr)
 				}
 				vendorID, err := readIDFromFile(basePath, dev.addr, "vendor")
 				if err != nil || vendorID != "10de" {
-					log.Println("Vendor has changed on the system ", dev.addr)
+					klog.Infof("Vendor has changed on the system %v", dev.addr)
 					return nil, fmt.Errorf("invalid allocation request: unknown device: %s", dev.addr)
 				}
 
@@ -350,7 +354,7 @@ func (dpi *GenericDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.Al
 		}
 		responses.ContainerResponses = append(responses.ContainerResponses, allocated_response)
 	}
-
+	klog.Infof("Allocate Response %v", responses)
 	return &responses, nil
 }
 
@@ -387,29 +391,28 @@ func (dpi *GenericDevicePlugin) GetPreferredAllocation(ctx context.Context, in *
 
 // Health check of GPU devices
 func (dpi *GenericDevicePlugin) healthCheck() error {
-	method := fmt.Sprintf("healthCheck(%s)", dpi.devpluginName)
-	log.Printf("%s: invoked", method)
+	method := fmt.Sprintf("healthCheck(DevicePlugin %s)", dpi.devpluginName)
 	var pathDeviceMap = make(map[string]string)
 	var path = dpi.devicePath
 	var health = ""
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Printf("%s: Unable to create fsnotify watcher: %v", method, err)
+		klog.Infof("%s: Unable to create fsnotify watcher: %v", method, err)
 		return err
 	}
 	defer watcher.Close()
 
 	err = watcher.Add(filepath.Dir(dpi.socketPath))
 	if err != nil {
-		log.Printf("%s: Unable to add device plugin socket path to fsnotify watcher: %v", method, err)
+		klog.Infof("%s: Unable to add device plugin socket path to fsnotify watcher: %v", method, err)
 		return err
 	}
 
 	_, err = os.Stat(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			log.Printf("%s: Unable to stat device: %v", method, err)
+			klog.Infof("%s: Unable to stat device: %v", method, err)
 			return err
 		}
 	}
@@ -417,10 +420,10 @@ func (dpi *GenericDevicePlugin) healthCheck() error {
 	for _, dev := range dpi.devs {
 		devicePath := filepath.Join(path, dev.ID)
 		err = watcher.Add(devicePath)
-		log.Printf(" Adding Watcher to Path : %v", devicePath)
+		klog.Infof(" Adding Watcher to Path : %v", devicePath)
 		pathDeviceMap[devicePath] = dev.ID
 		if err != nil {
-			log.Printf("%s: Unable to add device path to fsnotify watcher: %v", method, err)
+			klog.Infof("%s: Unable to add device path to fsnotify watcher: %v", method, err)
 			return err
 		}
 	}
@@ -437,19 +440,19 @@ func (dpi *GenericDevicePlugin) healthCheck() error {
 					health = v
 					dpi.healthy <- health
 				} else if (event.Op == fsnotify.Remove) || (event.Op == fsnotify.Rename) {
-					log.Printf("%s: Marking device unhealthy: %s", method, event.Name)
+					klog.Infof("%s: Marking device unhealthy: %s", method, event.Name)
 					health = v
 					dpi.unhealthy <- health
 				}
-			} else if event.Name == dpi.socketPath && event.Op == fsnotify.Remove {
+			} else if event.Name == dpi.socketPath && (event.Op&fsnotify.Remove == fsnotify.Remove || event.Op&fsnotify.Create == fsnotify.Create) {
 				// Watcher event for removal of socket file
-				log.Printf("%s: Socket path for GPU device was removed, kubelet likely restarted", method)
+				klog.Infof("%s: Socket path for GPU device was removed, kubelet likely restarted", method)
 				// Trigger restart of the DP servers
 				if err := dpi.restart(); err != nil {
-					log.Printf("%s: Unable to restart server %v", method, err)
+					klog.Infof("%s: Unable to restart server %v", method, err)
 					return err
 				}
-				log.Printf("%s: Successfully restarted %s device plugin server. Terminating.", method, dpi.devpluginName)
+				klog.Infof("%s: Successfully restarted %s device plugin server. Terminating.", method, dpi.devpluginName)
 				return nil
 			}
 		}

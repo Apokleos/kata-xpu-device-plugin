@@ -2,10 +2,10 @@ package cdi
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 
 	"gopkg.in/yaml.v3"
+	"k8s.io/klog"
 )
 
 // CurrentVersion is the current version of the Spec.
@@ -48,9 +48,9 @@ func (cs *CdiSpec) initSpec() {
 	}
 }
 
-func New() *CdiSpec {
+func New(version string) *CdiSpec {
 	cs := CdiSpec{
-		Version: CurrentVersion,
+		Version: version,
 		Kind:    DefaultKind,
 	}
 	return &cs
@@ -82,7 +82,7 @@ func (cs *CdiSpec) NewDevice(devName string, annotations map[string]string, devi
 	cs.Devices = append(cs.Devices, device)
 }
 
-func (spec *CdiSpec) Save(cdiPath, fName, format string) {
+func (spec *CdiSpec) Save(cdiPath, fName, format string) error {
 	suffix := ".json"
 	if format == "YAML" {
 		suffix = ".yaml"
@@ -92,8 +92,8 @@ func (spec *CdiSpec) Save(cdiPath, fName, format string) {
 	file_path := cdiPath + fName + suffix
 	file, err := os.Create(file_path)
 	if err != nil {
-		fmt.Println("Error creating file:", err)
-		return
+		klog.Infof("CDI Config creating failed with error %v", err)
+		return err
 	}
 	defer file.Close()
 
@@ -107,23 +107,24 @@ func (spec *CdiSpec) Save(cdiPath, fName, format string) {
 		defer encoder.Close()
 		encoder.SetIndent(2)
 		if err := encoder.Encode(&spec); err != nil {
-			fmt.Println("Error encoding YAML:", err)
-			return
+			klog.Infoln("Error encoding YAML:", err)
+			return err
 		}
 	// Serialize the CdiSpec instance to JSON file
 	default:
 		data, err = json.MarshalIndent(spec, "", "  ")
 		if err != nil {
-			fmt.Println("Error marshalling JSON:", err)
-			return
+			klog.Infoln("Error marshalling JSON:", err)
+			return err
 		}
 		if _, err = file.Write(data); err != nil {
-			fmt.Println("Error writing to file:", err)
-			return
+			klog.Infoln("Error writing to file:", err)
+			return err
 		}
 	}
 
-	fmt.Println("Data successfully written to file")
+	klog.Infof("Data successfully written to CDI Config %v", file_path)
+	return nil
 }
 
 // func exampleCdiSpec() CdiSpec {
@@ -211,7 +212,7 @@ func (spec *CdiSpec) Save(cdiPath, fName, format string) {
 // 		log.Fatalf("error: %v", err)
 // 	}
 
-// 	fmt.Printf("Parsed JSON: %+v\n", CdiSpec)
+// 	klog.Infof("Parsed JSON: %+v\n", CdiSpec)
 // }
 
 // func Load2() {
@@ -221,7 +222,7 @@ func (spec *CdiSpec) Save(cdiPath, fName, format string) {
 // 		log.Fatalf("error: %v", err)
 // 	}
 
-// 	fmt.Printf("Parsed YAML: %+v\n", CdiSpec)
+// 	klog.Infof("Parsed YAML: %+v\n", CdiSpec)
 // }
 
 // func main() {

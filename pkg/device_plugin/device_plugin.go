@@ -3,7 +3,6 @@ package device_plugin
 import (
 	"bufio"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,13 +17,13 @@ import (
 const (
 	nvidiaVendorID = "10de"
 	cdiConfigPath  = "/var/run/cdi/"
+	vfioPath       = "/dev/vfio"
 )
 
 // Structure to hold details about Nvidia GPU Device
 type NvidiaGpuDevice struct {
 	addr  string // PCI address of device
 	index uint   // PCI device index on PCI Bus
-
 }
 
 // Key is iommu group id and value is a list of gpu devices part of the iommu group
@@ -41,51 +40,70 @@ var startDevicePlugin = startDevicePluginFunc
 
 var stop = make(chan struct{})
 
-func InitiateDevicePlugin() {
+func InitiateDevicePlugin(strategy string, version string) ([]*GenericDevicePlugin, bool, error) {
+	var devicePlugins []*GenericDevicePlugin
 	//Identifies GPUs and represents it in appropriate structures
 	createIommuDeviceMap()
 
 	// Generate cdi spec for vfio devices
-	generateCDISpec(iommuMap)
+	if err := generateCDISpec(iommuMap, version); err != nil {
+		return devicePlugins, true, err
+	}
 
-	//Creates and starts device plugin
-	createDevicePlugins()
+	return createDevicePlugins(strategy)
 }
 
-func generateCDISpec(iommuMap map[string][]NvidiaGpuDevice) {
-	cs := cdihandler.New()
+func StopPlugins(devicePlugins []*GenericDevicePlugin) error {
+	klog.Infof("[createDevicePlugins] Shutting down device plugin controller")
+	for _, v := range devicePlugins {
+		if err := v.Stop(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func generateCDISpec(iommuMap map[string][]NvidiaGpuDevice, version string) error {
+	cs := cdihandler.New(version)
 	cs.NewContainerEdits(nil)
 
 	for devName, devices := range iommuMap {
 		//devName string, annotations map[string]string, devices []*DeviceNode
+		annotations := map[string]string{}
 		for _, dev := range devices {
-			annotations := map[string]string{
-				"attach-pci": "true",
+			if version >= cdihandler.CurrentVersion {
+				annotations = map[string]string{
+					"attach-pci": "true",
+				}
+				key := fmt.Sprintf("%svfio%v", cdihandler.CdiK8SPrefix, devName)
+				value := fmt.Sprintf("%s=%v", cdihandler.DefaultKind, dev.index)
+				annotations[key] = value
+				annotations["bdf"] = dev.addr
 			}
-			key := fmt.Sprintf("%svfio%v", cdihandler.CdiK8SPrefix, devName)
-			value := fmt.Sprintf("%s=%v", cdihandler.DefaultKind, dev.index)
-			annotations[key] = value
-			annotations["bdf"] = dev.addr
-
 			cdiDevs := []*cdihandler.DeviceNode{}
 			node := cdihandler.DeviceNode{
-				Path: fmt.Sprintf("/dev/vfio/%s", devName),
+				Path: fmt.Sprintf("%s/%s", vfioPath, devName),
 			}
 			cdiDevs = append(cdiDevs, &node)
 			cs.NewDevice(fmt.Sprintf("%v", dev.index), annotations, cdiDevs)
 		}
 	}
 
-	cs.Save(cdiConfigPath, "cdi-vfio-xxxx", "YAML")
+	if err := cs.Save(cdiConfigPath, "cdi-gpu-vfio", "YAML"); err != nil {
+		klog.Infof("[generateCDISpec] save cdi config  %v failed", fmt.Sprintf("%v/cdi-gpu-vfio.yaml", cdiConfigPath))
+		return err
+	}
+
+	return nil
 }
 
 // Starts gpu pass through device plugin
-func createDevicePlugins() {
+func createDevicePlugins(strategy string) ([]*GenericDevicePlugin, bool, error) {
 	var devicePlugins []*GenericDevicePlugin
 	var devs []*pluginapi.Device
 	// Iommu Map map[214:[{0000:c1:00.0}] 215:[{0000:c5:00.0}] 75:[{0000:3d:00.0}] 76:[{0000:41:00.0}]]
-	log.Printf("createDevicePlugins Iommu Map %v", iommuMap)
-	log.Printf("createDevicePlugins Device Map %v", deviceMap)
+	klog.Infof("[createDevicePlugins] IommuMap %v", iommuMap)
+	klog.Infof("[createDevicePlugins] DeviceMap %v", deviceMap)
 
 	//Iterate over deivceMap to create device plugin for each type of GPU on the host
 	for k, v := range deviceMap {
@@ -98,24 +116,21 @@ func createDevicePlugins() {
 		}
 		devpluginName := getDeviceName(k)
 		if devpluginName == "" {
-			log.Printf("Error: Could not find device name for device id: %s", k)
+			klog.Infof("[createDevicePlugins] WARN: Could not find device name for device id: %s", k)
 			devpluginName = k
 		}
-		log.Printf("Device Plugin Name %s", devpluginName)
-		dp := NewGenericDevicePlugin(devpluginName, "/dev/vfio/", devs)
+		klog.Infof("[createDevicePlugins] Device Plugin Name %s", devpluginName)
+		dp := NewGenericDevicePlugin(devpluginName, vfioPath, devs, strategy)
 		err := startDevicePlugin(dp)
 		if err != nil {
-			log.Printf("Error starting %s device plugin: %v", dp.devpluginName, err)
+			klog.Infof("[createDevicePlugins] Error starting %s device plugin: %v", dp.devpluginName, err)
+			return devicePlugins, true, err
 		} else {
 			devicePlugins = append(devicePlugins, dp)
 		}
 	}
 
-	<-stop
-	log.Printf("Shutting down device plugin controller")
-	for _, v := range devicePlugins {
-		v.Stop()
-	}
+	return devicePlugins, false, nil
 }
 
 func startDevicePluginFunc(dp *GenericDevicePlugin) error {
@@ -123,25 +138,26 @@ func startDevicePluginFunc(dp *GenericDevicePlugin) error {
 }
 
 // Discovers all Nvidia GPUs which are loaded with VFIO-PCI driver and creates corresponding maps
-func createIommuDeviceMap() {
+func createIommuDeviceMap() error {
 	iommuMap = make(map[string][]NvidiaGpuDevice)
 	deviceMap = make(map[string][]string)
 	// pci device index on PCI bus, begin at index=0
 	busIndex := uint(0)
 	//Walk directory to discover pci devices
+	// basePath := /sys/bus/pci/devices
 	filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			log.Printf("Error accessing file path %q: %v\n", path, err)
+			klog.Infof("[createIommuDeviceMap] Error accessing file path %q: %v\n", path, err)
 			return err
 		}
 		if info.IsDir() {
-			log.Println("Not a device, continuing")
+			klog.Infof("[createIommuDeviceMap] Not a device, continuing")
 			return nil
 		}
 		//Retrieve vendor for the device
 		vendorID, err := readIDFromFile(basePath, info.Name(), "vendor")
 		if err != nil {
-			log.Println("Could not get vendor ID for device ", info.Name())
+			klog.Infof("[createIommuDeviceMap] Could not get vendor ID for device %v", info.Name())
 			return nil
 		}
 
@@ -150,20 +166,20 @@ func createIommuDeviceMap() {
 			//Retrieve iommu group for the device
 			driver, err := readLink(basePath, info.Name(), "driver")
 			if err != nil {
-				log.Println("Could not get driver for device ", info.Name())
+				klog.Infof("[createIommuDeviceMap] Could not get driver for device %v ", info.Name())
 				return nil
 			}
 			if driver == "vfio-pci" {
 				iommuGroup, err := readLink(basePath, info.Name(), "iommu_group")
 				if err != nil {
-					log.Println("Could not get IOMMU Group for device ", info.Name())
+					klog.Infof("[createIommuDeviceMap] Could not get IOMMU Group for device %v ", info.Name())
 					return nil
 				}
 				_, exists := iommuMap[iommuGroup]
 				if !exists {
 					deviceID, err := readIDFromFile(basePath, info.Name(), "device")
 					if err != nil {
-						log.Println("Could get deviceID for PCI address ", info.Name())
+						klog.Infof("[createIommuDeviceMap] Could get deviceID with info Name %v", info.Name())
 						return nil
 					}
 					deviceMap[deviceID] = append(deviceMap[deviceID], iommuGroup)
@@ -177,6 +193,8 @@ func createIommuDeviceMap() {
 		}
 		return nil
 	})
+
+	return nil
 }
 
 // Read a file to retrieve ID
@@ -209,7 +227,7 @@ func getDeviceName(deviceID string) string {
 	devpluginName := ""
 	file, err := os.Open(pciIdsFilePath)
 	if err != nil {
-		log.Printf("Error opening pci ids file %s", pciIdsFilePath)
+		klog.Infof("Error opening pci ids file %s", pciIdsFilePath)
 		return ""
 	}
 	defer file.Close()
@@ -217,7 +235,7 @@ func getDeviceName(deviceID string) string {
 	// Locate beginning of NVIDIA device list in pci.ids file
 	scanner, err := locateVendor(file, nvidiaVendorID)
 	if err != nil {
-		log.Printf("Error locating NVIDIA in pci.ds file: %v", err)
+		klog.Infof("Error locating NVIDIA in pci.ds file: %v", err)
 		return ""
 	}
 
@@ -231,7 +249,7 @@ func getDeviceName(deviceID string) string {
 		}
 		// if line does not start with tab, we are visiting a different vendor
 		if !strings.HasPrefix(line, "\t") {
-			log.Printf("Could not find NVIDIA device with id: %s", deviceID)
+			klog.Infof("Could not find NVIDIA device with id: %s", deviceID)
 			return ""
 		}
 		if !strings.HasPrefix(line, prefix) {
@@ -253,7 +271,7 @@ func getDeviceName(deviceID string) string {
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Printf("Error reading pci ids file %s", err)
+		klog.Infof("Error reading pci ids file %s", err)
 	}
 	return devpluginName
 }

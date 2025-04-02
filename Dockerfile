@@ -28,23 +28,22 @@ ARG CUDA_IMAGE=cuda
 ARG CUDA_VERSION=12.5.1
 ARG BASE_DIST=ubi8
 
-FROM nvcr.io/nvidia/${CUDA_IMAGE}:${CUDA_VERSION}-base-${BASE_DIST} as builder
+RUN yum install -y wget make gcc systemd-devel
 
 RUN yum install -y wget make gcc
 
 ARG GOLANG_VERSION=1.22.5
-RUN wget -nv -O - https://storage.googleapis.com/golang/go${GOLANG_VERSION}.linux-amd64.tar.gz \
-    | tar -C /usr/local -xz
+RUN wget -nv -O - https://storage.googleapis.com/golang/go${GOLANG_VERSION}.linux-amd64.tar.gz |
+    tar -C /usr/local -xz
 
 ENV GOPATH /go
 ENV PATH $GOPATH/bin:/usr/local/go/bin:$PATH
 
-ENV GOOS=linux\
-    GOARCH=amd64
+ENV GOOS=linux GOARCH=amd64
 
 WORKDIR /go/src/kata-xpu-device-plugin
 
-COPY . . 
+COPY . .
 
 RUN make build
 
@@ -54,18 +53,8 @@ ARG VERSION
 
 LABEL io.k8s.display-name="KataContainers GPU Device Plugin"
 LABEL name="KataContainers GPU Device Plugin"
-LABEL vendor="NVIDIA"
-LABEL version="${VERSION}"
-LABEL release="N/A"
-LABEL summary="NVIDIA device plugin for KataContainers"
-LABEL description="See summary"
 
-RUN mkdir /licenses && mv /NGC-DL-CONTAINER-LICENSE /licenses/NGC-DL-CONTAINER-LICENSE
-
-COPY --from=builder /go/src/kata-xpu-device-plugin/nvidia-kata-xpu-device-plugin /usr/bin/
+COPY --from=builder /go/src/kata-xpu-device-plugin/kata-xpu-device-plugin /usr/bin/
 COPY --from=builder /go/src/kata-xpu-device-plugin/utils/pci.ids /usr/pci.ids
 
-RUN yum update -y
-
 CMD ["kata-xpu-device-plugin"]
-
